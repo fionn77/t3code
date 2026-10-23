@@ -1,5 +1,6 @@
 import {
   DEFAULT_PROVIDER_HEALTH_REFRESH_INTERVAL,
+  type ProviderDriverKind,
   UsageLimitSourceError,
   type UsageLimitSourceConsumeResetCreditInput,
   type ProviderConsumeResetCreditResult,
@@ -44,6 +45,39 @@ function sourceLabel(id: string, config: UsageLimitSourceConfig): string {
   } catch {
     return fallback;
   }
+}
+
+/**
+ * When a hub's pool of `driver` accounts can take requests again: the earliest
+ * moment any one of them has all its exhausted windows reset. Null unless every
+ * reported account is exhausted with known reset times, because then the stop is
+ * explained by quota and not by something the hub cannot see.
+ */
+export function hubUsageLimitResetAt(
+  sources: ReadonlyArray<UsageLimitSourceSnapshot>,
+  driver: ProviderDriverKind,
+  nowMs: number,
+): string | null {
+  const accounts = sources.flatMap((source) =>
+    source.accounts.filter((account) => account.driver === driver),
+  );
+  let earliest: string | null = null;
+  for (const account of accounts) {
+    if (account.usageLimits.unavailable) return null;
+    const exhausted = account.usageLimits.windows.filter((window) => window.usedPercent >= 100);
+    if (exhausted.length === 0) return null;
+    let resetsAt: string | null = null;
+    for (const window of exhausted) {
+      if (!window.resetsAt) return null;
+      if (resetsAt === null || Date.parse(window.resetsAt) > Date.parse(resetsAt)) {
+        resetsAt = window.resetsAt;
+      }
+    }
+    if (resetsAt !== null && (earliest === null || Date.parse(resetsAt) < Date.parse(earliest))) {
+      earliest = resetsAt;
+    }
+  }
+  return earliest !== null && Date.parse(earliest) > nowMs ? earliest : null;
 }
 
 /** @public Service construction is part of the canonical Effect module API. */

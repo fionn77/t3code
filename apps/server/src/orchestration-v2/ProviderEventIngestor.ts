@@ -11,6 +11,7 @@ import {
   type ModelSelection,
   type RuntimeMode,
   type ProviderInteractionMode,
+  type ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
   ProviderThreadId,
@@ -29,7 +30,9 @@ import * as Schema from "effect/Schema";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import { isTemporaryWorktreeBranch } from "@t3tools/shared/git";
 import { getModelSelectionStringOptionValue, modelSelectionsEqual } from "@t3tools/shared/model";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as AnalyticsService from "../telemetry/AnalyticsService.ts";
+import * as UsageLimitSources from "../usage/UsageLimitSources.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -93,6 +96,47 @@ export const layerAnalytics = Layer.effect(
       record: (properties: Readonly<Record<string, unknown>>) =>
         analytics.record("provider.turn.completed", properties),
     };
+  }),
+);
+
+/**
+ * Reset time for a usage-limit stop the provider gave none for. Instances that
+ * publish their own usage windows own their reset; others, such as Codex or
+ * Claude routed through a CLIProxyAPI pool with a proxy key, fall back to the
+ * environment's usage hubs.
+ */
+export class UsageLimitResetFallback extends Context.Reference<{
+  readonly resetAt: (input: {
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly driver: ProviderDriverKind;
+  }) => Effect.Effect<string | null>;
+}>("t3/orchestration-v2/UsageLimitResetFallback", {
+  defaultValue: () => ({ resetAt: () => Effect.succeed(null) }),
+}) {}
+
+export const layerUsageLimitResetFallback = Layer.effect(
+  UsageLimitResetFallback,
+  Effect.gen(function* () {
+    const providers = yield* ProviderRegistry.ProviderRegistry;
+    const hubs = yield* UsageLimitSources.UsageLimitSources;
+    const resetAt = Effect.fn("UsageLimitResetFallback.resetAt")(function* (input: {
+      readonly providerInstanceId: ProviderInstanceId;
+      readonly driver: ProviderDriverKind;
+    }) {
+      const provider = (yield* providers.getProviders).find(
+        (candidate) => candidate.instanceId === input.providerInstanceId,
+      );
+      const limits = provider?.usageLimits;
+      if (limits && !limits.unavailable && limits.windows.length > 0) return null;
+      // The last poll can predate the stop by a whole refresh interval.
+      yield* hubs.refresh.pipe(Effect.timeout("5 seconds"), Effect.ignore);
+      return UsageLimitSources.hubUsageLimitResetAt(
+        yield* hubs.current,
+        input.driver,
+        DateTime.toEpochMillis(yield* DateTime.now),
+      );
+    });
+    return { resetAt };
   }),
 );
 
@@ -308,6 +352,7 @@ export const layer: Layer.Layer<
     const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
     const analytics = yield* ProviderTurnAnalytics;
     const agentScope = yield* AgentScope;
+    const usageLimitReset = yield* UsageLimitResetFallback;
     const completedTurnAnalytics = new Set<string>();
 
     const makeDomainEvent =
@@ -687,9 +732,19 @@ export const layer: Layer.Layer<
                 return dismissed;
               }
               const occurredAt = yield* DateTime.now;
-              const failure = (yield* agentScope.oomKilled(input.threadId))
+              const reported = (yield* agentScope.oomKilled(input.threadId))
                 ? { ...input.event.failure, message: "Killed: out of memory.", code: "oom_kill" }
                 : input.event.failure;
+              const failure =
+                reported.class === "usage_limit" && reported.resetAt == null
+                  ? {
+                      ...reported,
+                      resetAt: yield* usageLimitReset.resetAt({
+                        providerInstanceId: input.providerInstanceId,
+                        driver: input.event.driver,
+                      }),
+                    }
+                  : reported;
               return [
                 ...dismissed,
                 yield* makeDomainEvent(input, {

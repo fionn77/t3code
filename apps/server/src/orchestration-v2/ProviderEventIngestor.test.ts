@@ -23,6 +23,7 @@ import {
   RunId,
   RuntimeRequestId,
   TurnItemId,
+  UsageLimitSourceId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -36,6 +37,8 @@ import * as Stream from "effect/Stream";
 import { toolOutputImages } from "@t3tools/shared/toolOutput";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerConfig from "../config.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import * as UsageLimitSources from "../usage/UsageLimitSources.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
@@ -274,6 +277,128 @@ it.effect("records accepted billed turn usage once without billing the context w
       durationMs: 120,
     });
   }).pipe(Effect.provide(layerTest.pipe(Layer.provide(layerAnalytics))));
+});
+
+it.effect("fills a missing usage-limit reset from the fallback and keeps a reported one", () => {
+  const lookups: Array<{ readonly providerInstanceId: string; readonly driver: string }> = [];
+  const layerResetFallback = Layer.succeed(ProviderEventIngestor.UsageLimitResetFallback, {
+    resetAt: (input) =>
+      Effect.sync(() => {
+        lookups.push(input);
+        return "2026-10-23T23:33:00.000Z";
+      }),
+  });
+  return Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+    const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+    const idAllocator = yield* IdAllocator.IdAllocatorV2;
+    const threadEvent = yield* threadCreatedEvent(now);
+    yield* eventSink.write({ events: [threadEvent] });
+    const providerSessionId = yield* idAllocator.allocate.providerSession({
+      providerInstanceId: modelSelection.instanceId,
+      threadId: threadEvent.threadId,
+    });
+    const providerThreadId = idAllocator.derive.providerThread({
+      driver: CODEX_DRIVER,
+      nativeThreadId: "limited-thread",
+    });
+    const stop = (nativeTurnId: string, ordinal: number, resetAt: string | null) =>
+      ingestor.ingestNormalized({
+        providerSessionId,
+        providerInstanceId: modelSelection.instanceId,
+        threadId: threadEvent.threadId,
+        event: {
+          type: "turn.terminal",
+          driver: CODEX_DRIVER,
+          providerThreadId,
+          providerTurnId: idAllocator.derive.providerTurn({ driver: CODEX_DRIVER, nativeTurnId }),
+          runOrdinal: ordinal,
+          failureItemOrdinal: 100 + ordinal,
+          status: "failed",
+          failure: makeProviderFailure({
+            message: "You've hit your usage limit.",
+            code: "usageLimitExceeded",
+            class: "usage_limit",
+            resetAt,
+          }),
+          threadDisposition: "reusable",
+        },
+      });
+
+    yield* stop("limited-turn-unknown", 1, null);
+    yield* stop("limited-turn-known", 2, "2026-10-24T01:33:00.000Z");
+
+    const projection = yield* projectionStore.getThreadProjection(threadEvent.threadId);
+    const resets = projection.visibleTurnItems.flatMap(({ item }) =>
+      item.type === "error" ? [item.failure.resetAt] : [],
+    );
+    assert.deepEqual(resets, ["2026-10-23T23:33:00.000Z", "2026-10-24T01:33:00.000Z"]);
+    assert.deepEqual(lookups, [
+      { providerInstanceId: modelSelection.instanceId, driver: CODEX_DRIVER },
+    ]);
+  }).pipe(Effect.provide(layerTest.pipe(Layer.provide(layerResetFallback))));
+});
+
+it.effect("asks the hubs only for instances without usage windows of their own", () => {
+  let refreshes = 0;
+  const checkedAt = "2026-10-23T19:59:00.000Z";
+  const resetsAt = "2099-01-01T00:00:00.000Z";
+  const window = { id: "session", kind: "session" as const, label: "Session" };
+  const layerFallback = ProviderEventIngestor.layerUsageLimitResetFallback.pipe(
+    Layer.provide(
+      Layer.succeed(ProviderRegistry.ProviderRegistry, {
+        getProviders: Effect.succeed([
+          {
+            instanceId: ProviderInstanceId.make("codex"),
+            usageLimits: { checkedAt, windows: [{ ...window, usedPercent: 99, resetsAt }] },
+          },
+          {
+            instanceId: ProviderInstanceId.make("codex_pool"),
+            usageLimits: { checkedAt, windows: [], unavailable: { reason: "unsupported" } },
+          },
+        ]),
+      } as unknown as ProviderRegistry.ProviderRegistry["Service"]),
+    ),
+    Layer.provide(
+      Layer.succeed(UsageLimitSources.UsageLimitSources, {
+        refresh: Effect.sync(() => {
+          refreshes += 1;
+        }),
+        current: Effect.succeed([
+          {
+            id: UsageLimitSourceId.make("hub"),
+            kind: "cliproxy" as const,
+            label: "Hub",
+            checkedAt,
+            accounts: [
+              {
+                id: "pooled",
+                driver: CODEX_DRIVER,
+                usageLimits: { checkedAt, windows: [{ ...window, usedPercent: 100, resetsAt }] },
+              },
+            ],
+          },
+        ]),
+      } as unknown as UsageLimitSources.UsageLimitSources["Service"]),
+    ),
+  );
+  return Effect.gen(function* () {
+    const fallback = yield* ProviderEventIngestor.UsageLimitResetFallback;
+    const native = yield* fallback.resetAt({
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      driver: CODEX_DRIVER,
+    });
+    assert.equal(native, null);
+    assert.equal(refreshes, 0);
+    const pooled = yield* fallback.resetAt({
+      providerInstanceId: ProviderInstanceId.make("codex_pool"),
+      driver: CODEX_DRIVER,
+    });
+    assert.equal(pooled, resetsAt);
+    assert.equal(refreshes, 1);
+  }).pipe(Effect.provide(layerFallback));
 });
 
 layer("ProviderEventIngestorV2", (it) => {

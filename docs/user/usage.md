@@ -141,6 +141,10 @@ This connection supplies usage information; configure
 the provider separately to send agent requests through the hub. Remove the hub from the same
 settings section when you no longer need it.
 
+When a provider that sends requests through the hub stops on a usage limit without its own reset
+time, and every pooled account for that provider is used up, the stop shows when the first of them
+resets, so you can resume then.
+
 ## Subscription usage widget
 
 Add **Subscription usage** from your iOS or Android widget gallery to see remaining Codex and
