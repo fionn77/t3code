@@ -54,7 +54,6 @@ import {
 } from "~/lib/selectionActions";
 import {
   GhosttyTerminalSurface,
-  isTerminalPasteShortcut,
   type GhosttyTerminalSurfaceOptions,
 } from "~/terminal/ghostty/surface";
 import { isEditableFocused } from "~/lib/editableFocus";
@@ -65,7 +64,9 @@ import { isTerminalUrl } from "../terminal-links";
 import {
   isDiffToggleShortcut,
   isTerminalClearShortcut,
+  isTerminalCopyShortcut,
   isTerminalNewShortcut,
+  isTerminalPasteShortcut,
   isTerminalSplitShortcut,
   isTerminalSplitVerticalShortcut,
   isTerminalToggleShortcut,
@@ -964,6 +965,12 @@ function TerminalSessionViewport({
         const clipboardCommand = resolveShortcutCommand(event, currentKeybindings, options);
         if (clipboardCommand === "terminal.copy" || clipboardCommand === "terminal.paste") {
           if (clipboardCommand === "terminal.paste" && isTerminalPasteShortcut(event)) return true;
+          if (
+            clipboardCommand === "terminal.copy" &&
+            terminalRef.current?.hasSelection() &&
+            isTerminalCopyShortcut(event)
+          )
+            return true;
           event.preventDefault();
           event.stopPropagation();
           clearSelectionAction();
