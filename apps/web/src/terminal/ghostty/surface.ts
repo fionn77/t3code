@@ -338,7 +338,7 @@ export function applyTerminalCopyEvent(
   return { preventDefault: true, claimWriteFallback: true };
 }
 
-function isTerminalPasteShortcut(
+export function isTerminalPasteShortcut(
   event: Pick<KeyboardEvent, "ctrlKey" | "key" | "metaKey" | "shiftKey">,
   platform = navigator.platform,
 ) {

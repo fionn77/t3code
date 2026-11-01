@@ -54,8 +54,10 @@ import {
 } from "~/lib/selectionActions";
 import {
   GhosttyTerminalSurface,
+  isTerminalPasteShortcut,
   type GhosttyTerminalSurfaceOptions,
 } from "~/terminal/ghostty/surface";
+import { isEditableFocused } from "~/lib/editableFocus";
 import { type GhosttyColor, type GhosttyTheme } from "~/terminal/ghostty/core";
 import { useOpenInPreferredEditor } from "../editorPreferences";
 import { resolvePathLinkTarget } from "@t3tools/shared/fileLinks";
@@ -939,7 +941,13 @@ function TerminalSessionViewport({
 
       function handleBeforeKey(event: KeyboardEvent): boolean {
         const currentKeybindings = readKeybindings();
-        const options = { context: { terminalFocus: true, terminalOpen: true } };
+        const options = {
+          context: {
+            terminalFocus: true,
+            terminalOpen: true,
+            editableFocus: isEditableFocused(event.target),
+          },
+        };
         if (preventTerminalCloseShortcut(event, currentKeybindings)) {
           return false;
         }
@@ -955,6 +963,7 @@ function TerminalSessionViewport({
 
         const clipboardCommand = resolveShortcutCommand(event, currentKeybindings, options);
         if (clipboardCommand === "terminal.copy" || clipboardCommand === "terminal.paste") {
+          if (clipboardCommand === "terminal.paste" && isTerminalPasteShortcut(event)) return true;
           event.preventDefault();
           event.stopPropagation();
           clearSelectionAction();
